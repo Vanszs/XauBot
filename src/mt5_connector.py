@@ -11,14 +11,111 @@ import numpy as np
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 import time
 from loguru import logger
 
+import os
+
+# MT5 backend resolution:
+#   1) Native MetaTrader5 (Windows / Wine Python directly)
+#   2) mt5linux rpyc bridge (Linux client -> Wine Python server)
+# The bridge client is created lazily via get_mt5_backend() so that importing
+# this module never blocks on a network connection.
+mt5 = None
+_MT5_BACKEND = "none"
+
 try:
-    import MetaTrader5 as mt5
+    import MetaTrader5 as mt5  # type: ignore
+    _MT5_BACKEND = "native"
 except ImportError:
-    logger.warning("MetaTrader5 not installed. Running in simulation mode.")
-    mt5 = None
+    try:
+        import mt5linux  # type: ignore  # noqa: F401
+        _MT5_BACKEND = "bridge"  # available, connect lazily in get_mt5_backend()
+    except Exception:  # noqa: BLE001
+        _MT5_BACKEND = "none"
+
+
+def _bridge_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
+    """Return True if something is listening on host:port."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_bridge_running(host: str, port: int) -> bool:
+    """Best-effort: start the MT5 bridge (Xvfb + rpyc server) if it's down.
+
+    Lets the bot auto-connect without the user launching anything manually.
+    Only attempts a local autostart when host is loopback. Returns True if the
+    port is open afterwards.
+    """
+    if _bridge_port_open(host, port):
+        return True
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return False  # remote bridge: not ours to start
+
+    import subprocess
+    import time
+    script = Path(__file__).resolve().parent.parent / "scripts" / "mt5_bridge.sh"
+    if not script.exists():
+        logger.warning(f"MT5 bridge autostart skipped: {script} not found")
+        return False
+
+    logger.info("MT5 bridge down -> auto-starting via scripts/mt5_bridge.sh up ...")
+    try:
+        subprocess.run(
+            ["bash", str(script), "up"],
+            timeout=150,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"MT5 bridge autostart error: {e}")
+
+    # Wait for the port to come up
+    for _ in range(30):
+        if _bridge_port_open(host, port):
+            logger.info("MT5 bridge is up.")
+            return True
+        time.sleep(1)
+    logger.warning("MT5 bridge did not come up; falling back to simulation.")
+    return False
+
+
+def get_mt5_backend():
+    """Return an MT5 API object, connecting the rpyc bridge on first use.
+
+    On Linux this will auto-start the Wine bridge (scripts/mt5_bridge.sh up)
+    if it is not already running, so the bot connects with no manual steps.
+    Returns None if no backend is available (simulation mode).
+    """
+    global mt5
+    if mt5 is not None:
+        return mt5
+    if _MT5_BACKEND == "bridge":
+        host = os.getenv("MT5_BRIDGE_HOST", "127.0.0.1")
+        port = int(os.getenv("MT5_BRIDGE_PORT", "18812"))
+        # Auto-start the bridge if it isn't already listening (opt-out via env).
+        if os.getenv("MT5_BRIDGE_AUTOSTART", "1") not in ("0", "false", "False"):
+            _ensure_bridge_running(host, port)
+        try:
+            from mt5linux import MetaTrader5 as _MT5Bridge  # type: ignore
+            mt5 = _MT5Bridge(host=host, port=port)
+            logger.info(f"MetaTrader5 via mt5linux bridge {host}:{port}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"MT5 bridge connect failed ({host}:{port}): {e}. "
+                "Simulation mode."
+            )
+            mt5 = None
+    elif _MT5_BACKEND == "none":
+        logger.warning("MetaTrader5 unavailable. Running in simulation mode.")
+    return mt5
 
 
 @dataclass
@@ -127,6 +224,9 @@ class MT5Connector:
         Returns:
             True if connected successfully
         """
+        global mt5
+        if mt5 is None:
+            mt5 = get_mt5_backend()
         if mt5 is None:
             logger.warning("MT5 not available - simulation mode")
             return False
@@ -150,7 +250,21 @@ class MT5Connector:
                 if self.path:
                     kwargs["path"] = self.path
 
-                if mt5.initialize(**kwargs):
+                # On the mt5linux/Wine bridge the terminal is typically already
+                # logged in via GUI; initialize() without credentials attaches
+                # to it. Try attach-mode first, then fall back to explicit login.
+                _initialized = False
+                if _MT5_BACKEND == "bridge":
+                    try:
+                        _initialized = mt5.initialize()
+                    except Exception:
+                        _initialized = False
+                    if not _initialized:
+                        _initialized = mt5.initialize(**kwargs)
+                else:
+                    _initialized = mt5.initialize(**kwargs)
+
+                if _initialized:
                     # Wait for terminal to fully initialize
                     time.sleep(2)  # Increased delay for stability
 
@@ -176,8 +290,10 @@ class MT5Connector:
                     self._account_info = self._get_account_info()
                     logger.info(f"Connected to MT5: {self.server} (Account: {self.login})")
 
-                    # Pre-select common symbols to ensure they're ready
-                    mt5.symbol_select("XAUUSD", True)
+                    # Pre-select the configured trading symbol so it's ready.
+                    # Broker-specific name (e.g. XM uses 'GOLD', not 'XAUUSD').
+                    _sym = os.getenv("SYMBOL", "XAUUSD")
+                    mt5.symbol_select(_sym, True)
                     time.sleep(0.5)
 
                     return True

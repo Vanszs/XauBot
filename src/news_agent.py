@@ -178,7 +178,7 @@ class NewsAgent:
             try:
                 # Try to get calendar events (broker-dependent)
                 # Some brokers don't expose this API
-                events = mt5.copy_ticks_from("XAUUSD", now - timedelta(hours=1), 1, mt5.COPY_TICKS_INFO)
+                events = mt5.copy_ticks_from(os.getenv("SYMBOL", "XAUUSD"), now - timedelta(hours=1), 1, mt5.COPY_TICKS_INFO)
                 # If we get here, try calendar
                 calendar_events = []
 
