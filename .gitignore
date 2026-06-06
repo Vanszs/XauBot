@@ -43,6 +43,7 @@ env/
 
 # Logs (ignore all content)
 logs/
+*.log
 
 # Data files (large)
 data/market_data/
@@ -54,8 +55,14 @@ models/*.pkl
 models/*.joblib
 models/*.h5
 
-# Backtest results (generated)
+# Backtest results (generated run artifacts)
 backtests/results/*.csv
+backtests/*_results/
+backtests/**/*.xlsx
+backtests/**/*.log
+backtests/ml_v3/training_log*.txt
+backtests/ml_v3/*.pkl
+backtests/*_results/*.pkl
 
 # Node modules (dashboard)
 web-dashboard/node_modules/
@@ -85,9 +92,14 @@ archive/
 bot.pid
 bot_output.log
 nul
+data/bot.lock
 data/bot_status.json
 data/signal_persistence.json
 data/model_metrics.json
+
+# Stray analysis output dumps
+*_analysis_output.txt
+training_output.log
 
 # Claude Code local settings
 .claude/
@@ -95,3 +107,6 @@ backtests/.claude/
 
 # Screenshots
 *.png
+
+# Kiro CLI local settings
+.kiro/
