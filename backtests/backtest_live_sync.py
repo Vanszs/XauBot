@@ -884,7 +884,9 @@ def main():
 
     # Fetch maximum historical data
     print("Fetching historical data...")
-    df = mt5.get_market_data(symbol="XAUUSD", timeframe="M15", count=50000)
+    import os
+    _symbol = os.getenv("SYMBOL", "XAUUSD")
+    df = mt5.get_market_data(symbol=_symbol, timeframe="M15", count=50000)
 
     if len(df) == 0:
         print("ERROR: No data received")
