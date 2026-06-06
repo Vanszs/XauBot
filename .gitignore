@@ -110,3 +110,6 @@ backtests/.claude/
 
 # Kiro CLI local settings
 .kiro/
+
+# Generated multi-TF dataset cache
+data/multitf_dataset.parquet

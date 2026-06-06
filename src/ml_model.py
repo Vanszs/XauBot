@@ -487,13 +487,20 @@ class TradingModel:
 
 
 def get_default_feature_columns() -> List[str]:
-    """Get default feature columns for ML model."""
+    """Get default feature columns for ML model.
+
+    NOTE: Only scale-invariant / stationary features are included. Absolute
+    price-level indicators (raw ema_9/ema_21, raw macd) are intentionally
+    EXCLUDED because they become out-of-distribution when the live price
+    differs from the training range. Use their normalized forms instead
+    (ema*_dist_atr, ema_spread_atr, macd_*_bps).
+    """
     return [
-        # Technical indicators
-        "rsi", "atr", "atr_percent",
-        "macd", "macd_signal", "macd_histogram",
+        # Technical indicators (stationary)
+        "rsi", "atr_percent",
+        "macd_bps", "macd_signal_bps", "macd_hist_bps",
         "bb_percent_b", "bb_width",
-        "ema_9", "ema_21",
+        "ema9_dist_atr", "ema21_dist_atr", "ema_spread_atr",
         
         # Returns and momentum
         "returns_1", "returns_5", "returns_20",
@@ -518,11 +525,24 @@ def get_default_feature_columns() -> List[str]:
         "ob",
         "bos", "choch",
         "market_structure",
+
+        # SMC premium/discount + displacement
+        "range_position", "premium_zone", "discount_zone", "equilibrium_zone",
+        "displacement", "displacement_strength",
         
         # Time features
         "hour", "weekday",
         "london_session", "ny_session",
-        
+
+        # Economic-news calendar features (timing-based, always populated)
+        "news_high_impact_today", "news_window",
+        "hours_to_news", "news_risk",
+
+        # NOTE: cal_forecast/cal_previous/cal_actual/cal_surprise/cal_surprise_abs
+        # are EXCLUDED by default — they are constant 0 with the recurring
+        # calendar provider (no real values). Add them back only when a real
+        # economic-calendar CSV (data/economic_calendar.csv) is configured.
+
         # Regime
         "regime",
     ]

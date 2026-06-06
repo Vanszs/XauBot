@@ -223,6 +223,80 @@ class SMCAnalyzer:
         df = self.calculate_fvg(df)
         df = self.calculate_order_blocks(df)
         df = self.calculate_bos_choch(df)
+        df = self.calculate_premium_discount(df)
+        df = self.calculate_displacement(df)
+        return df
+
+    def calculate_premium_discount(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Premium/Discount zones relative to the most recent swing range.
+
+        Core SMC concept: institutions buy in *discount* (below 50% of the
+        dealing range) and sell in *premium* (above 50%). Uses the forward-
+        filled last swing high/low (confirmed with lag -> no look-ahead).
+
+        Produces:
+          - eq_level        : 50% equilibrium of the last swing range
+          - range_position  : 0..1 position of close in [swing_low, swing_high]
+                              (0 = at low/discount, 1 = at high/premium)
+          - premium_zone    : 1 if close > 62% of range
+          - discount_zone   : 1 if close < 38% of range
+          - equilibrium_zone: 1 if within 38-62% (no-trade chop area)
+        """
+        if "last_swing_high" not in df.columns or "last_swing_low" not in df.columns:
+            return df
+
+        hi = pl.col("last_swing_high")
+        lo = pl.col("last_swing_low")
+        rng = (hi - lo)
+        # position of close within range; guard zero/None range
+        pos = pl.when(rng > 0).then((pl.col("close") - lo) / rng).otherwise(0.5)
+        pos = pos.clip(0.0, 1.0)
+
+        df = df.with_columns([
+            ((hi + lo) / 2.0).alias("eq_level"),
+            pos.alias("range_position"),
+        ])
+        df = df.with_columns([
+            (pl.col("range_position") > 0.62).cast(pl.Int8).alias("premium_zone"),
+            (pl.col("range_position") < 0.38).cast(pl.Int8).alias("discount_zone"),
+            ((pl.col("range_position") >= 0.38) & (pl.col("range_position") <= 0.62))
+                .cast(pl.Int8).alias("equilibrium_zone"),
+        ])
+        return df
+
+    def calculate_displacement(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Displacement: strong impulsive candles signalling institutional intent.
+
+        A displacement candle has a body much larger than recent average range
+        and closes near its extreme (low wick in trend direction). This is the
+        key 1M scalping trigger (sweep -> displacement -> entry).
+
+        Produces:
+          - body_size       : abs(close-open)
+          - displacement    : 1 bullish disp, -1 bearish disp, 0 none
+          - displacement_strength : body / avg_range (0 if none)
+        """
+        body = (pl.col("close") - pl.col("open"))
+        abs_body = body.abs()
+        candle_range = (pl.col("high") - pl.col("low"))
+        # average range over the PRIOR 20 bars (shift to exclude current bar,
+        # so a bar is compared against history, not itself).
+        avg_range = candle_range.shift(1).rolling_mean(window_size=20)
+
+        # strong body: >= 1.5x avg range, and body dominates the candle (>=60%)
+        is_strong = (abs_body >= 1.5 * avg_range) & (candle_range > 0) & \
+                    (abs_body / pl.when(candle_range > 0).then(candle_range).otherwise(1.0) >= 0.6)
+
+        strength = pl.when(is_strong & (avg_range > 0)) \
+            .then(abs_body / avg_range).otherwise(0.0)
+
+        df = df.with_columns([
+            abs_body.alias("body_size"),
+            pl.when(is_strong & (body > 0)).then(1)
+              .when(is_strong & (body < 0)).then(-1)
+              .otherwise(0).cast(pl.Int8).alias("displacement"),
+            strength.fill_null(0.0).alias("displacement_strength"),
+        ])
         return df
     
     def calculate_fvg(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -441,20 +515,23 @@ class SMCAnalyzer:
         ob = np.zeros(n, dtype=np.int8)
         ob_top = np.full(n, np.nan)
         ob_bottom = np.full(n, np.nan)
-        
+
+        # NO LOOKAHEAD: the OB is only *known* at the confirmation bar i (when the
+        # swing + structure break is complete). We therefore record the signal at
+        # bar i, not at the origin bar j. ob_top/ob_bottom carry the origin zone
+        # so downstream logic still knows where the block is, but the feature
+        # becomes available exactly when a live trader would see it.
         for i in range(self.ob_lookback, n):
             # Check for swing low -> Bullish Order Block
-            # FIX: NO LOOKAHEAD - validate OB at CURRENT bar, not future bar
             if swing_lows[i] == -1:
                 # Look for last bearish candle before swing low
                 for j in range(i - 1, max(0, i - self.ob_lookback), -1):
                     if closes[j] < opens[j]:  # Bearish candle
-                        # FIX: Validate OB using CURRENT bar (closes[i]) not future bar
-                        # OB is valid if current close is above OB high (structure broken)
+                        # OB valid if current close broke above OB high (structure)
                         if closes[i] > highs[j]:
-                            ob[j] = 1  # Bullish OB
-                            ob_top[j] = highs[j]
-                            ob_bottom[j] = lows[j]
+                            ob[i] = 1  # Bullish OB confirmed at bar i
+                            ob_top[i] = highs[j]
+                            ob_bottom[i] = lows[j]
                             break
 
             # Check for swing high -> Bearish Order Block
@@ -462,12 +539,11 @@ class SMCAnalyzer:
                 # Look for last bullish candle before swing high
                 for j in range(i - 1, max(0, i - self.ob_lookback), -1):
                     if closes[j] > opens[j]:  # Bullish candle
-                        # FIX: Validate OB using CURRENT bar (closes[i]) not future bar
-                        # OB is valid if current close is below OB low (structure broken)
+                        # OB valid if current close broke below OB low (structure)
                         if closes[i] < lows[j]:
-                            ob[j] = -1  # Bearish OB
-                            ob_top[j] = highs[j]
-                            ob_bottom[j] = lows[j]
+                            ob[i] = -1  # Bearish OB confirmed at bar i
+                            ob_top[i] = highs[j]
+                            ob_bottom[i] = lows[j]
                             break
         
         # Add to DataFrame

@@ -591,12 +591,210 @@ class FeatureEngineer:
                     .cast(pl.Int8)
                     .alias("ny_session"),
             ])
-        
+
+            # Economic-news calendar features (recurring US high-impact events).
+            # Deterministic from the bar timestamp, so they work for both
+            # historical training data and live inference.
+            df = self.calculate_news_features(df)
+
+        # Stationary, scale-invariant versions of price-level indicators.
+        # Absolute EMA/MACD scale with price and become out-of-distribution when
+        # the live price differs from the training range (e.g. GOLD trained at
+        # ~2000-3000 but trading at ~4300). These normalized forms stay valid.
+        if "ema_9" in df.columns and "ema_21" in df.columns and "atr" in df.columns:
+            df = df.with_columns([
+                # EMA distance in ATR units (how far price is from each EMA)
+                pl.when(pl.col("atr") > 0)
+                  .then((pl.col("close") - pl.col("ema_9")) / pl.col("atr"))
+                  .otherwise(0.0).alias("ema9_dist_atr"),
+                pl.when(pl.col("atr") > 0)
+                  .then((pl.col("close") - pl.col("ema_21")) / pl.col("atr"))
+                  .otherwise(0.0).alias("ema21_dist_atr"),
+                # EMA spread normalized (trend strength, scale-free)
+                pl.when(pl.col("atr") > 0)
+                  .then((pl.col("ema_9") - pl.col("ema_21")) / pl.col("atr"))
+                  .otherwise(0.0).alias("ema_spread_atr"),
+            ])
+        if "macd" in df.columns:
+            df = df.with_columns([
+                # MACD family in basis points of price (scale-free)
+                (pl.col("macd") / pl.col("close") * 10000).alias("macd_bps"),
+                (pl.col("macd_signal") / pl.col("close") * 10000).alias("macd_signal_bps"),
+                (pl.col("macd_histogram") / pl.col("close") * 10000).alias("macd_hist_bps"),
+            ])
+
         # Drop temporary columns
         df = df.drop(["_sma_20"])
         
         logger.debug("ML features calculated")
         return df
+
+    def calculate_news_features(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Add economic-news calendar features derived from the bar timestamp.
+
+        US high-impact events that move XAUUSD follow a recurring monthly
+        schedule:
+          - NFP  : first Friday of the month (13:30 UTC)
+          - CPI  : ~day 12 of the month (13:30 UTC)
+          - PPI  : ~day 13 of the month (13:30 UTC)
+          - FOMC : ~8 meetings/yr; approximated as ~day 18 of Jan/Mar/May/Jun/
+                   Jul/Sep/Oct/Dec (19:00 UTC)
+
+        These approximations let the model learn news-driven regimes without an
+        external calendar feed. Features produced:
+          - news_high_impact_today : 1 if a high-impact event falls on this date
+          - news_window            : 1 if within +/- 2h of a high-impact release
+          - hours_to_news          : hours until the nearest high-impact release
+                                     today (clipped to [-12, 12]; 99 if none)
+          - news_risk              : 0..1 proximity risk (1 = at release time)
+        """
+        if "time" not in df.columns or df["time"].dtype != pl.Datetime:
+            return df
+
+        day = pl.col("time").dt.day()
+        wd = pl.col("time").dt.weekday()        # Mon=1 .. Sun=7 (polars)
+        month = pl.col("time").dt.month()
+        hour = pl.col("time").dt.hour()
+
+        # First Friday of month -> NFP. First Friday day-of-month is in 1..7
+        # and is a Friday (weekday == 5).
+        is_nfp_day = (wd == 5) & (day <= 7)
+        # CPI ~12th, PPI ~13th (use a small window to absorb scheduling drift)
+        is_cpi_day = (day >= 11) & (day <= 13)
+        is_ppi_day = (day >= 12) & (day <= 14)
+        # FOMC months (approx) and ~18th
+        fomc_months = [1, 3, 5, 6, 7, 9, 10, 12]
+        is_fomc_day = month.is_in(fomc_months) & (day >= 17) & (day <= 19)
+
+        high_impact_day = (is_nfp_day | is_cpi_day | is_ppi_day | is_fomc_day)
+
+        # Release hours: data releases 13:30 UTC, FOMC 19:00 UTC.
+        # Use the closest release hour active on the day for proximity.
+        release_hour = (
+            pl.when(is_fomc_day).then(pl.lit(19))
+            .otherwise(pl.lit(13))
+        )
+
+        hours_to = (release_hour - hour).cast(pl.Float64)
+        hours_to_clipped = (
+            pl.when(~high_impact_day).then(pl.lit(99.0))
+            .otherwise(hours_to.clip(-12.0, 12.0))
+        )
+
+        # Proximity risk: 1 at release, decaying over +/- 4h window.
+        risk = (
+            pl.when(~high_impact_day).then(pl.lit(0.0))
+            .otherwise((1.0 - (hours_to.abs() / 4.0)).clip(0.0, 1.0))
+        )
+
+        df = df.with_columns([
+            high_impact_day.cast(pl.Int8).alias("news_high_impact_today"),
+            (high_impact_day & (hours_to.abs() <= 2))
+                .cast(pl.Int8).alias("news_window"),
+            hours_to_clipped.alias("hours_to_news"),
+            risk.alias("news_risk"),
+        ])
+
+        # Point-in-time economic calendar values (forecast/previous always,
+        # actual/surprise only after each event's release_time -> no leakage).
+        df = self.merge_economic_calendar(df)
+        return df
+
+    def merge_economic_calendar(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Merge forecast/previous/actual/surprise from the economic calendar,
+        respecting point-in-time availability (no look-ahead leakage).
+
+        Rules per bar (by timestamp t):
+          - forecast / previous : known in advance -> taken from the most recent
+            event whose release_time <= t OR the next upcoming event same day
+            (forecast is published before the release). We expose the *upcoming
+            or just-released* event's forecast/previous.
+          - actual / surprise   : only set when t >= release_time of that event;
+            before the release they are 0 (matches live conditions).
+
+        Produces columns:
+          cal_forecast, cal_previous, cal_actual, cal_surprise, cal_surprise_abs
+        All default to 0.0 when no nearby event or values are unknown (NaN->0).
+        """
+        if "time" not in df.columns or df["time"].dtype != pl.Datetime:
+            return df
+
+        try:
+            from src.economic_calendar import get_events
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"economic_calendar unavailable: {e}")
+            return df
+
+        tmin = df["time"].min()
+        tmax = df["time"].max()
+        if tmin is None or tmax is None:
+            return df
+
+        from datetime import timedelta
+        events = get_events(tmin - timedelta(days=2), tmax + timedelta(days=2))
+        if events is None or events.height == 0:
+            # still emit zero columns for schema stability
+            return df.with_columns([
+                pl.lit(0.0).alias(c) for c in
+                ("cal_forecast", "cal_previous", "cal_actual",
+                 "cal_surprise", "cal_surprise_abs")
+            ])
+
+        # surprise computed at source (may be NaN if forecast/actual unknown)
+        events = events.with_columns(
+            (pl.col("actual") - pl.col("forecast")).alias("_surprise")
+        ).sort("release_time")
+
+        df = df.sort("time")
+
+        # join_asof backward: attach the most recent event at/<= bar time.
+        # This gives forecast/previous/actual of the last released event.
+        past = df.join_asof(
+            events.select([
+                pl.col("release_time"),
+                pl.col("forecast").alias("_fc_past"),
+                pl.col("previous").alias("_prev_past"),
+                pl.col("actual").alias("_act_past"),
+                pl.col("_surprise").alias("_surp_past"),
+            ]),
+            left_on="time", right_on="release_time", strategy="backward",
+        )
+
+        # join_asof forward: attach the next upcoming event (>= bar time) so we
+        # can expose its forecast/previous BEFORE the release (no actual).
+        nxt = df.join_asof(
+            events.select([
+                pl.col("release_time").alias("_next_release"),
+                pl.col("forecast").alias("_fc_next"),
+                pl.col("previous").alias("_prev_next"),
+            ]),
+            left_on="time", right_on="_next_release", strategy="forward",
+        ).select(["_next_release", "_fc_next", "_prev_next"])
+
+        merged = pl.concat([past, nxt], how="horizontal")
+
+        # forecast/previous: prefer the upcoming event's values when an event is
+        # near in the future (its forecast is already public); otherwise fall
+        # back to the last released event's values.
+        cal_forecast = pl.coalesce([pl.col("_fc_next"), pl.col("_fc_past")])
+        cal_previous = pl.coalesce([pl.col("_prev_next"), pl.col("_prev_past")])
+        # actual/surprise only from PAST (already released) events.
+        cal_actual = pl.col("_act_past")
+        cal_surprise = pl.col("_surp_past")
+
+        merged = merged.with_columns([
+            cal_forecast.fill_nan(0.0).fill_null(0.0).alias("cal_forecast"),
+            cal_previous.fill_nan(0.0).fill_null(0.0).alias("cal_previous"),
+            cal_actual.fill_nan(0.0).fill_null(0.0).alias("cal_actual"),
+            cal_surprise.fill_nan(0.0).fill_null(0.0).alias("cal_surprise"),
+        ]).with_columns(
+            pl.col("cal_surprise").abs().alias("cal_surprise_abs")
+        )
+
+        return merged.drop([
+            "_fc_past", "_prev_past", "_act_past", "_surp_past",
+            "_next_release", "_fc_next", "_prev_next", "release_time",
+        ], strict=False)
     
     def create_target(
         self,

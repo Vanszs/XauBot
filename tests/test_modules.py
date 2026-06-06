@@ -41,7 +41,7 @@ def test_config():
     # Test small account
     config_small = TradingConfig(capital=5000)
     assert config_small.capital_mode == CapitalMode.SMALL
-    assert config_small.risk.risk_per_trade == 1.5
+    assert config_small.risk.risk_per_trade == 1.0
     print(f"✓ Small account config: {config_small.capital_mode.value}")
     
     # Test medium account

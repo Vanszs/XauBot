@@ -230,12 +230,16 @@ def main():
         return
     
     try:
-        # Fetch data - MORE DATA for better generalization
+        # Fetch data - ~1 year of history for better generalization.
+        # M15: ~96 bars/day * ~260 trading days ≈ 25k bars per year.
+        # MT5 returns as many bars as the broker has (up to this cap), so a
+        # higher cap simply grabs the maximum available. Override via TRAIN_BARS.
+        train_bars = int(os.getenv("TRAIN_BARS", "35000"))
         df = fetch_training_data(
             connector,
             config.symbol,
             config.execution_timeframe,
-            bars=15000,  # Increased for better HMM regime separation
+            bars=train_bars,
         )
         
         # Prepare features
